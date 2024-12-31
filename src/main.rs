@@ -7,6 +7,7 @@ use scraper::{Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::fs::{remove_file, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, available_parallelism};
 use std::time::{Duration, Instant};
@@ -293,6 +294,17 @@ fn get_files() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 fn download_decompress_save_to_file(file_name: &String) -> Result<File, std::io::Error> {
     let base_url = "https://dumps.wikimedia.org/enwiki/latest/";
     let file_url = format!("{}{}", base_url, file_name);
+
+    // Check if file already exists locally
+    let local_path = format!("downloads/{}", file_name.strip_suffix(".bz2").unwrap());
+    if let Ok(existing_file) = File::open(&local_path) {
+        println!("Using existing file: {}", local_path);
+        return Ok(existing_file);
+    }
+
+    // Create downloads directory if it doesn't exist
+    std::fs::create_dir_all("downloads")?;
+
     let client = reqwest::blocking::Client::new();
 
     let start_download = Instant::now();
@@ -313,28 +325,68 @@ fn download_decompress_save_to_file(file_name: &String) -> Result<File, std::io:
     let cursor = std::io::Cursor::new(compressed_data);
     let mut decompressor = BzDecoder::new(cursor);
 
-    let mut temp_file_path = std::env::temp_dir();
-    temp_file_path.push("decompressed_file.tmp");
-    let mut temp_file = OpenOptions::new()
+    let mut output_file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&temp_file_path)
+        .open(&local_path)
         .unwrap();
 
     let mut buffer = Vec::new();
     let _ = decompressor.read_to_end(&mut buffer);
-    temp_file.write_all(&buffer).unwrap();
-    println!("{} written to temp file", file_name);
-    File::open(&temp_file_path)
-    // if let Err(e) = decompressor.read_to_string(&mut decompressed_data) {
-    //     return Err(format!("Failed to decompress {}: {}", file_url, e));
-    // } else {
-    //     return Ok(decompressed_data);
-    // }
+    output_file.write_all(&buffer).unwrap();
+    println!("{} written to {}", file_name, local_path);
+
+    File::open(&local_path)
+}
+
+fn initialize_database(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Create a table to track migrations
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS migrations (
+            filename TEXT PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    // List of SQL files to run in order
+    let migrations = vec!["create_tables.sql", "language_codes.sql"];
+
+    for filename in migrations {
+        // Check if migration was already applied
+        let already_applied: bool = conn
+            .query_row(
+                "SELECT 1 FROM migrations WHERE filename = ?1",
+                [filename],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !already_applied {
+            println!("Applying migration: {}", filename);
+
+            // Read SQL file
+            let sql_path = Path::new(filename);
+            let sql =
+                std::fs::read_to_string(sql_path).expect(&format!("Failed to read {}", filename));
+
+            // Execute SQL statements
+            conn.execute_batch(&sql)?;
+
+            // Mark migration as applied
+            conn.execute("INSERT INTO migrations (filename) VALUES (?1)", [filename])?;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
+    let conn = Connection::open("test.db").unwrap();
+
+    // Initialize database before processing
+    initialize_database(&conn).unwrap();
+
     let files_to_download = get_files().unwrap();
     println!(
         "Directory listing contains {} items",
@@ -378,7 +430,7 @@ fn main() {
         // 64 divisions -> Total time: 5.86 minutes
         // Pretty much once you spawn num_cpu threads, performance doesn't increase
         let content_vec = divide_input(contents_file, Some(num_cpus));
-        
+
         let mut handles: Vec<thread::JoinHandle<Result<(), rusqlite::Error>>> = vec![];
         for group in content_vec {
             let conn_clone = Arc::clone(&conn);
@@ -388,7 +440,7 @@ fn main() {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             let _ = handle.join().expect("Thread panicked!");
         }
@@ -396,5 +448,4 @@ fn main() {
         // println!("Processing of {:?} took {:?}", path, total_time_end);
         println!("Processing of {:?} took {:?}", article, total_time_end);
     }
-    let _ = remove_file("/tmp/decompressed_file.tmp");
 }
